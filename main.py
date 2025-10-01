@@ -16,7 +16,7 @@ app.add_middleware(
     allow_headers=['*'],
 )
 
-@app.get('/departures')
+@app.get('/')
 def get_departures(station: str = 'KGX'):
     api_id = os.getenv('TRANSPORT_API_ID')
     api_key = os.getenv('TRANSPORT_API_KEY')
