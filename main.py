@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import requests
+from fastapi.responses import JSONResponse
+from fastapi import status
 import os
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,37 +12,32 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=['https://mindthedash.netlify.app'],
     allow_credentials=True,
-    allow_methods=['*'],
+    allow_methods=['GET'],
     allow_headers=['*'],
 )
 
+RAILDATA_API_KEY = os.environ.get('RAILDATA_API_KEY') 
+RAILDATA_BASE_URL = os.environ.get('RAILDATA_URL')
+
 @app.get('/')
-def get_departures(station: str = 'KGX'):
-    api_id = os.getenv('TRANSPORT_API_ID')
-    api_key = os.getenv('TRANSPORT_API_KEY')
+async def get_station_board(
+    station: str = Query(..., min_length=3, max_length=3),
+    numRows: int = Query(100)
+):
+    url = f'{RAILDATA_BASE_URL}/{station.upper()}?numRows={numRows}'
 
-    if not api_id or not api_key:
-        raise HTTPException(status_code=500, detail='Transport API credentials not set')
-
-    url = f'https://transportapi.com/v3/uk/train/station_timetables/{station}.json'
-    params = {
-        'app_id': api_id,
-        'app_key': api_key,
-        'darwin': 'true',
-        'train_status': 'passenger',
-        'station_detail': 'destination,calling_at',
-        'to_offset': 'PT06:00:00',
-        'limit': '50'
+    headers = {
+        'x-apikey': RAILDATA_API_KEY,
     }
 
     try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        return {
-            'station': station,
-            'departures': response.json().get('departures', {})
-        }
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f'Error fetching data from TransportAPI: {e}')
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers)
+            return response.json()
+    except Exception as e:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={'error': str(e)}
+        )

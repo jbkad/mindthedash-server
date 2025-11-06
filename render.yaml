@@ -2,11 +2,11 @@ services:
   - type: web
     name: mindthedash-backend
     env: python
-    buildCommand: ""
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
-    plan: free
+    plan: starter
     envVars:
-      - key: TRANSPORT_API_ID
+      - key: RAILDATA_API_KEY
         sync: false
-      - key: TRANSPORT_API_KEY
+      - key: RAILDATA_URL
         sync: false
