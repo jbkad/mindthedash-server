@@ -12,7 +12,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['https://mindthedash.netlify.app'],
+    allow_origins=['http://localhost:3000', 'https://mindthedash.netlify.app'],
     allow_credentials=True,
     allow_methods=['GET'],
     allow_headers=['*'],
