@@ -158,7 +158,7 @@ def filter_departures_to_one_am(departures):
 @app.get('/')
 async def get_station_board(
     station: str = Query(..., min_length=3, max_length=3),
-    numRows: int = Query(100)
+    numRows: int = Query(150)
 ):
     url = f'{RAILDATA_BASE_URL}/{station.upper()}?numRows={numRows}'
 
