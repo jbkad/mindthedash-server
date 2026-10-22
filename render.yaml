@@ -3,10 +3,8 @@ services:
     name: mindthedash-backend
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: starter
     envVars:
-      - key: RAILDATA_API_KEY
-        sync: false
-      - key: RAILDATA_URL
+      - key: RTT_ACCESS_TOKEN
         sync: false
