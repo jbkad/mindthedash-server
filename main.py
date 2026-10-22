@@ -1,277 +1,201 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi import status
-import os
-import httpx
+"""Server-side adapter for RTT's next-generation location API."""
 import asyncio
-from dotenv import load_dotenv
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+from time import monotonic
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-load_dotenv()
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+load_dotenv(Path(__file__).with_name('.env'))
+LONDON = ZoneInfo('Europe/London')
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=['http://localhost:3000', 'https://mindthedash.netlify.app'],
-    allow_credentials=True,
-    allow_methods=['GET'],
-    allow_headers=['*'],
-)
 
-RAILDATA_API_KEY = os.environ.get('RAILDATA_API_KEY') 
-RAILDATA_BASE_URL = os.environ.get('RAILDATA_URL')
+def object_value(value):
+    if not isinstance(value, dict):
+        raise ValueError('Expected an RTT object')
+    return value
 
-def _to_list(maybe_list):
-    if not maybe_list:
-        return []
-    return maybe_list if isinstance(maybe_list, list) else [maybe_list]
 
-def _extract_services(payload):
-    if isinstance(payload, list):
-        return payload
+def timestamp(value, local_timezone=None):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError('Invalid RTT timestamp')
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        if local_timezone is None:
+            raise ValueError('RTT timestamp has no timezone')
+        parsed = parsed.replace(tzinfo=local_timezone)
+    return parsed
 
-    if 'GetDepartureBoardResponse' in payload:
-        result = (
-            payload.get('GetDepartureBoardResponse', {})
-            .get('GetDepartureBoardResult', {})
-        )
-        return _to_list(result.get('trainServices', {}).get('service', []))
 
-    if 'GetDepartureBoardWithDetailsResponse' in payload:
-        result = (
-            payload.get('GetDepartureBoardWithDetailsResponse', {})
-            .get('GetDepartureBoardWithDetailsResult', {})
-        )
-        return _to_list(result.get('trainServices', {}).get('service', []))
-
-    if 'GetDepBoardWithDetailsResponse' in payload:
-        result = (
-            payload.get('GetDepBoardWithDetailsResponse', {})
-            .get('GetDepBoardWithDetailsResult', {})
-        )
-        return _to_list(result.get('trainServices', {}).get('service', []))
-
-    if 'trainServices' in payload:
-        services = payload.get('trainServices', [])
-        if isinstance(services, dict):
-            services = services.get('service', [])
-        return _to_list(services)
-
-    return []
-
-def normalize_departure_board(payload):
-    """
-    Normalise RailData LDBWS GetDepartureBoard response into a stable shape:
-    { departures: { all: [ ... ] } }
-    """
-    services = _extract_services(payload)
-
-    normalized = []
-    for svc in services:
-        if not isinstance(svc, dict):
+def normalize_board(payload):
+    payload = object_value(payload)
+    services = payload.get('services')
+    if not isinstance(services, list):
+        raise ValueError('RTT response has no services array')
+    rows = []
+    system = object_value(payload.get('systemStatus') or {})
+    schedule_only = system.get('rttCore') == 'SCHEDULE_ONLY' or system.get('realtimeNetworkRail') == 'REALTIME_DATA_NONE'
+    for service in services:
+        service = object_value(service)
+        metadata = object_value(service.get('scheduleMetadata') or {})
+        temporal = object_value(service.get('temporalData') or {})
+        departure = object_value(temporal.get('departure') or {})
+        scheduled = timestamp(departure.get('scheduleAdvertised'), LONDON)
+        # exclude arrivals, passing trains, non-passenger and non-train services
+        if not scheduled or metadata.get('inPassengerService') is False:
             continue
-        destinations = svc.get('destination', {})
-        if isinstance(destinations, dict):
-            destinations = destinations.get('location', [])
-        destinations = _to_list(destinations)
-        subsequent = svc.get('subsequentCallingPoints', {})
-        if isinstance(subsequent, list):
-            calling_points = subsequent
-        else:
-            calling_points = subsequent.get('callingPointList', [])
-        calling_points = _to_list(calling_points)
-
-        calling_at = []
-        for group in calling_points:
-            for cp in _to_list(group.get('callingPoint', [])):
-                calling_at.append({
-                    'station_code': cp.get('crs'),
-                    'station_name': cp.get('locationName'),
-                })
-
-        normalized.append({
-            'service_id': svc.get('serviceID'),
-            'aimed_departure_time': svc.get('std'),
-            'expected_departure_time': svc.get('etd'),
-            'platform': svc.get('platform'),
-            'operator_name': svc.get('operator'),
-            'delay_reason': svc.get('delayReason'),
-            'cancel_reason': svc.get('cancelReason'),
-            'is_cancelled': svc.get('isCancelled'),
-            'destination_name': destinations[0].get('locationName') if destinations else None,
-            'station_detail': {
-                'destination': {
-                    'station_code': destinations[0].get('crs') if destinations else None,
-                },
-                'calling_at': calling_at,
-            },
+        if metadata.get('modeType') not in (None, 'TRAIN'):
+            continue
+        if temporal.get('scheduledCallType') not in ('ADVERTISED_OPEN', 'ADVERTISED_PICK_UP'):
+            continue
+        if departure.get('realtimeActual'):
+            continue
+        cancelled = departure.get('isCancelled') is True or temporal.get('displayAs') == 'CANCELLED'
+        if temporal.get('displayAs') in ('PASS', 'DIVERTED', 'TERMINATES') and not cancelled:
+            continue
+        forecast = None if schedule_only else timestamp(departure.get('realtimeForecast') or departure.get('realtimeEstimate'), LONDON)
+        delay = round((forecast - scheduled).total_seconds() / 60) if forecast else None
+        status = 'cancelled' if cancelled else 'delayed' if delay is not None and delay > 0 else 'on_time' if forecast else 'scheduled'
+        platform = object_value(object_value(service.get('locationMetadata') or {}).get('platform') or {})
+        platform_kind = next((kind for kind in ('actual', 'forecast', 'planned') if isinstance(platform.get(kind), str) and platform[kind].strip()), None)
+        destinations = service.get('destination') or []
+        if not isinstance(destinations, list):
+            raise ValueError('Invalid RTT destinations')
+        destinations = [object_value(object_value(item).get('location') or {}) for item in destinations]
+        reasons = service.get('reasons') or []
+        if not isinstance(reasons, list):
+            raise ValueError('Invalid RTT reasons')
+        def reason(kind):
+            return next((r.get('longText') or r.get('shortText') for r in map(object_value, reasons) if r.get('type') == kind), None)
+        rows.append({
+            'service_id': metadata.get('uniqueIdentity'),
+            'departure_at': scheduled.isoformat(),
+            'source_departure_at': departure.get('scheduleAdvertised'),
+            'source_expected_departure_at': departure.get('realtimeForecast') or departure.get('realtimeEstimate'),
+            'expected_departure_at': forecast.isoformat() if forecast else None,
+            'aimed_departure_time': scheduled.astimezone(LONDON).strftime('%H:%M'),
+            'expected_departure_time': 'Cancelled' if cancelled else forecast.astimezone(LONDON).strftime('%H:%M') if forecast else None,
+            'status': status,
+            'delay_minutes': max(0, delay) if delay is not None else None,
+            'platform': platform[platform_kind] if platform_kind else None,
+            'platform_status': platform_kind or 'unknown',
+            'platform_values': platform,
+            'operator_name': object_value(metadata.get('operator') or {}).get('name'),
+            'is_cancelled': cancelled,
+            'delay_reason': reason('DELAY'),
+            'cancel_reason': reason('CANCEL'),
+            'destination_name': ' / '.join(d.get('description') or 'Unknown destination' for d in destinations) or 'Unknown destination',
         })
-
-    normalized = filter_departures_to_one_am(normalized)
-
-    return {
-        'departures': {
-            'all': normalized
-        }
-    }
+    rows.sort(key=lambda row: timestamp(row['departure_at']))
+    return {'departures': {'all': rows}, 'query': payload.get('query'), 'system_status': system, 'source': 'Realtime Trains'}
 
 
-def merge_normalized_departures(payloads):
-    seen = set()
-    merged = []
+class RTTClient:
+    def __init__(self, client, access_token=None, refresh_token=None, version=None):
+        self.client = client
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.version = version
+        self.valid_until = None
+        self.cache = OrderedDict()
+        # coalesce identical requests, including concurrent browser requests.
+        self.lock = asyncio.Lock()
 
-    for payload in payloads:
-        rows = normalize_departure_board(payload).get('departures', {}).get('all', [])
-        for row in rows:
-            key = row.get('service_id') or (
-                row.get('aimed_departure_time'),
-                row.get('destination_name'),
-                row.get('operator_name'),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(row)
-
-    return {'departures': {'all': merged}}
-
-
-def filter_by_destination_or_calling_at(rows, to_code):
-    if not to_code:
-        return rows
-    target = to_code.upper()
-    filtered = []
-    for row in rows:
-        destination_code = (
-            row.get('station_detail', {})
-            .get('destination', {})
-            .get('station_code')
-        )
-        calls_at = any(
-            stop.get('station_code') == target
-            for stop in row.get('station_detail', {}).get('calling_at', [])
-        )
-        if destination_code == target or calls_at:
-            filtered.append(row)
-    return filtered
-
-def filter_departures_to_one_am(departures):
-    tz = ZoneInfo('Europe/London')
-    now = datetime.now(tz)
-    end = datetime.combine((now + timedelta(days=1)).date(), time(1, 0), tzinfo=tz)
-
-    def _parse_departure_time(value):
-        if not value or not isinstance(value, str):
-            return None
-        raw = value.strip().upper()
-        is_pm = raw.endswith('PM')
-        is_am = raw.endswith('AM')
-        raw = raw.replace('AM', '').replace('PM', '').strip()
+    async def request_json(self, path, token, params=None):
+        headers = {'Authorization': f'Bearer {token}'}
+        if self.version:
+            headers['Version'] = self.version
         try:
-            hh, mm = raw.split(':', 1)
-            hour = int(hh)
-            minute = int(mm)
-            if is_pm and hour < 12:
-                hour += 12
-            if is_am and hour == 12:
-                hour = 0
-            dep_time = time(hour, minute)
-        except Exception:
+            response = await self.client.get(path, params=params, headers=headers)
+        except httpx.RequestError:
+            raise HTTPException(502, '502: Unable to reach Realtime Trains Data API.') from None
+        if response.status_code == 429:
+            retry = response.headers.get('Retry-After')
+            raise HTTPException(429, 'Realtime Trains rate limit reached; please try again later', headers={'Retry-After': retry} if retry and retry.isdigit() else None)
+        if response.status_code == 401:
+            raise HTTPException(503, 'RTT rejected the credential. Check token expiry and use RTT_REFRESH_TOKEN for a refresh token.')
+        if response.status_code == 403:
+            raise HTTPException(503, 'The RTT token does not have permission for this endpoint or search. Check the account entitlements.')
+        if response.status_code == 400:
+            raise HTTPException(502, 'RTT rejected the search; check the configured API version and time-window entitlement')
+        if response.status_code == 204:
             return None
-        dep_dt = datetime.combine(now.date(), dep_time, tzinfo=tz)
-        if dep_dt < now:
-            dep_dt = dep_dt + timedelta(days=1)
-        return dep_dt
+        if response.status_code != 200:
+            raise HTTPException(502, 'Realtime Trains returned an upstream error')
+        try:
+            return object_value(response.json())
+        except (ValueError, TypeError):
+            raise HTTPException(502, 'Realtime Trains returned an invalid response') from None
 
-    filtered = []
-    for dep in departures:
-        std = dep.get('aimed_departure_time')
-        etd = dep.get('expected_departure_time')
-        dep_dt = _parse_departure_time(etd) or _parse_departure_time(std)
-        if etd in ('Delayed', 'On time', 'Cancelled'):
-            dep_dt = _parse_departure_time(std)
-        if dep_dt and now <= dep_dt <= end:
-            filtered.append(dep)
-    return filtered
+    async def token(self):
+        if self.refresh_token:
+            if not self.access_token or not self.valid_until or datetime.now(timezone.utc) >= self.valid_until - timedelta(seconds=30):
+                data = await self.request_json('/api/get_access_token', self.refresh_token)
+                try:
+                    token = data['token']
+                    valid_until = timestamp(data['validUntil'])
+                    if not isinstance(token, str) or not token or not valid_until or valid_until <= datetime.now(timezone.utc):
+                        raise ValueError('Invalid token')
+                except (KeyError, TypeError, ValueError):
+                    raise HTTPException(502, 'RTT returned an invalid access-token response') from None
+                self.access_token, self.valid_until = token, valid_until
+        if not self.access_token:
+            raise HTTPException(503, 'Configure RTT_REFRESH_TOKEN on the server')
+        return self.access_token
+
+    async def board(self, station, destination, minutes):
+        key = (station, destination, minutes)
+        async with self.lock:
+            cached = self.cache.get(key)
+            if cached and monotonic() - cached[0] < 60:
+                self.cache.move_to_end(key)
+                return cached[1]
+            now = datetime.now(LONDON)
+            params = {'code': f'gb-nr:{station}', 'timeFrom': now.isoformat(), 'timeTo': (now + timedelta(minutes=minutes)).isoformat(), 'timeTolerance': 'true'}
+            if destination:
+                params['filterTo'] = f'gb-nr:{destination}'
+            data = await self.request_json('/rtt/location', await self.token(), params)
+            try:
+                result = normalize_board(data) if data is not None else {'departures': {'all': []}, 'query': {'timeFrom': params['timeFrom'], 'timeTo': params['timeTo']}, 'system_status': None, 'source': 'Realtime Trains'}
+            except (ValueError, TypeError, KeyError):
+                raise HTTPException(502, 'Realtime Trains returned an invalid departure board') from None
+            result['fetched_at'] = now.isoformat()
+            self.cache[key] = (monotonic(), result)
+            self.cache.move_to_end(key)
+            while len(self.cache) > 128:
+                self.cache.popitem(last=False)
+            return result
+
+
+@asynccontextmanager
+async def lifespan(app):
+    async with httpx.AsyncClient(base_url='https://data.rtt.io', timeout=15.0) as client:
+        app.state.rtt = RTTClient(client, os.getenv('RTT_ACCESS_TOKEN'), os.getenv('RTT_REFRESH_TOKEN'), os.getenv('RTT_API_VERSION'))
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000', 'https://mindthedash.netlify.app'], allow_methods=['GET'], allow_headers=['*'])
+
 
 @app.get('/')
-async def get_station_board(
-    station: str = Query(..., min_length=3, max_length=3),
-    to: Optional[str] = Query(None, min_length=3, max_length=3),
-    numRows: int = Query(150),
-    windowMinutes: int = Query(120, ge=30, le=240)
-):
-    headers = {
-        'x-apikey': RAILDATA_API_KEY,
-    }
-    offsets = range(0, windowMinutes, 30)
+async def get_station_board(request: Request, station: str = Query(..., pattern='^[A-Za-z]{3}$'), to: Optional[str] = Query(None, pattern='^[A-Za-z]{3}$'), numRows: int = Query(15, ge=1, le=15), windowMinutes: int = Query(1439, ge=1, le=1439)):
+    result = await request.app.state.rtt.board(station.upper(), to.upper() if to else None, windowMinutes)
+    rows = result['departures']['all']
+    return {**result, 'departures': {'all': rows[:numRows]}, 'coverage': {'matching_departures': len(rows), 'returned_departures': min(len(rows), numRows), 'truncated': len(rows) > numRows}}
 
-    station_code = station.upper()
-    to_code = to.upper() if to else None
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            async def fetch_payloads(path):
-                tasks = [
-                    client.get(
-                        f'{RAILDATA_BASE_URL}/{path}',
-                        headers=headers,
-                        params={'numRows': numRows, 'timeOffset': offset}
-                    )
-                    for offset in offsets
-                ]
-                responses = await asyncio.gather(*tasks)
-                return [response.json() for response in responses]
 
-            merged = merge_normalized_departures(await fetch_payloads(station_code))
-            rows = merged.get('departures', {}).get('all', [])
-
-            # Some products do not return results for /{from}/{to}; fallback to station-only board.
-            if to_code:
-                targeted = merge_normalized_departures(
-                    await fetch_payloads(f'{station_code}/{to_code}')
-                )
-                targeted_rows = targeted.get('departures', {}).get('all', [])
-                rows = targeted_rows if targeted_rows else rows
-                rows = filter_by_destination_or_calling_at(rows, to_code)
-
-            return {'departures': {'all': rows}}
-    except Exception as e:
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': str(e)}
-        )
-
-@app.get('/debug')
-async def debug_station_board(
-    station: str = Query(..., min_length=3, max_length=3),
-    numRows: int = Query(150)
-):
-    url = f'{RAILDATA_BASE_URL}/{station.upper()}?numRows={numRows}'
-
-    headers = {
-        'x-apikey': RAILDATA_API_KEY,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=headers)
-            try:
-                data = response.json()
-            except Exception:
-                data = {}
-            return {
-                'status': response.status_code,
-                'url': url,
-                'text_preview': response.text[:500],
-                'raw': data,
-                'normalized': normalize_departure_board(data)
-            }
-    except Exception as e:
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={'error': str(e)}
-        )
+@app.get('/health')
+async def health():
+    return {'status': 'ok', 'provider': 'rtt', 'configured': bool(os.getenv('RTT_ACCESS_TOKEN') or os.getenv('RTT_REFRESH_TOKEN'))}
